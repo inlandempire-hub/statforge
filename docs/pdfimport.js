@@ -681,7 +681,10 @@
   // These are clauses WITHIN an action, never action names — they must not start a
   // new entry (it stole the save off "Engulfing Bite" as a phantom "Strength Saving
   // Throw" action). No real action name contains "Saving Throw"/"Attack Roll".
-  const RE_CLAUSE_HEAD = /\b(?:Saving Throw|Attack Roll)\b/i;
+  // Also skip a bare "DC 15" candidate: when a "... Saving Throw:" clause wraps so
+  // the "DC 15. Failure:" tail starts a line, that tail is mis-read as an action.
+  // No real action name is just "DC <number>".
+  const RE_CLAUSE_HEAD = /\b(?:Saving Throw|Attack Roll)\b|^DC\s+\d/i;
   // A recovered (column/page-continuation) entry name can span a newline because
   // the next column opens with page chrome — a running header ("Genies of the
   // Earth"), a quote attribution ("- Grand Sultan Marrake") or a subtitle — glued
@@ -996,6 +999,11 @@
     // Some books (Crooked Moon) split the trailing small-cap 's' off section
     // headers, so pdf.js extracts "Bonu S Action S" / "Reaction S". Rejoin so the
     // section detector sees real "Bonus Actions" / "Reactions" / "Actions" headers.
+    // A wrapped stat clause splits "Saving Throw" / "Attack Roll" across a line so
+    // the tail ("Throw: DC 10", "Roll: +4") starts a line and is mis-read as an
+    // action entry (Drakkenheim's "Critical Hit: Constitution Saving\nThrow: DC 10").
+    // Rejoin the phrase so the clause-head guard recognises and skips it.
+    text = text.replace(/\bSaving\s*\n\s*Throw\b/g, "Saving Throw").replace(/\bAttack\s*\n\s*Roll\b/g, "Attack Roll");
     return text.replace(/\bBonu[ \t]+S\b/g, "Bonus")
                .replace(/\bReaction[ \t]+S\b/g, "Reactions")
                .replace(/\bAction[ \t]+S\b/g, "Actions");
@@ -1007,6 +1015,14 @@
     let lines = text.split(/\r?\n/).map(l => l.replace(/\s+$/, "")).filter(l => l.trim());
     lines = lines.map(dedupeLine);      // collapse bold double-draw ("Actions Actions")
     lines = trimFlavor(lines);          // drop trailing lore/rules prose (any assembly path)
+    // Drakkenheim prints a "Harvestable Components" crafting sidebar that column
+    // ordering can splice onto a stat block. It is not stat-block mechanics, and its
+    // "Animus:/Fluid:/Organs:/Hide:" lines otherwise parse as phantom actions (and a
+    // trailing next-creature heading leaks in). The table always opens with either the
+    // "Harvestable Components" header or its first field "Animus:" (never a real stat
+    // line), so cut the block at whichever appears first.
+    const hcI = lines.findIndex(l => /^(?:Harvestable Components\b|Animus[:.]\s)/i.test(l.trim()));
+    if (hcI > 0) lines = lines.slice(0, hcI);
     text = lines.join("\n");            // so the regexes + raw_text use the trimmed body
     let found = 0;
     const sb = {
@@ -1194,6 +1210,23 @@
   }
   const RE_FURNITURE = /^(?:[A-Za-z]|\d{1,4}|[A-Za-z]\s+\d{1,4}|\d{1,4}\s+[A-Za-z])$/;
   const isFurniture = (s) => RE_FURNITURE.test(s.trim());
+  // Some books (Drakkenheim) render section headers in a small-caps font that
+  // pdf.js extracts as spaced/mixed-case single glyphs — "a c T ions",
+  // "B onus a c T ions", "r E ac T ions". Left as-is they (a) don't match the
+  // section regex, so a block's Actions look absent (it wrongly merges with the
+  // next column and drops its tail — e.g. an apprentice's whole spell list), and
+  // (b) recur across pages, so the chrome filter strips them as running headers.
+  // Canonicalise any line whose letters-only, space-stripped, upper-cased form is
+  // EXACTLY a section keyword back to the real header. The exact-match guard means
+  // no ordinary content line is ever rewritten.
+  const SECT_CANON = { ACTIONS: "Actions", ACTION: "Actions", BONUSACTIONS: "Bonus Actions",
+    BONUSACTION: "Bonus Actions", REACTIONS: "Reactions", REACTION: "Reactions",
+    LEGENDARYACTIONS: "Legendary Actions", LEGENDARYACTION: "Legendary Actions" };
+  function canonSectionHeader(s) {
+    const t = (s || "").trim();
+    if (!t || t.length > 30 || !/^[A-Za-z][A-Za-z\s]*$/.test(t)) return s;   // letters + spaces only
+    return SECT_CANON[t.replace(/\s+/g, "").toUpperCase()] || s;
+  }
   function stripPageChrome(linePages) {
     const n = linePages.length;
     if (n < 4) return linePages;
@@ -1304,6 +1337,9 @@
   }
 
   function blocksFromPages(linePages, source, ocr) {
+    // canonicalise spaced small-caps section headers ("a c T ions" -> "Actions")
+    // BEFORE chrome-stripping, so the header is protected and its section parses
+    linePages = linePages.map(page => { const f = page.map(([t, ft]) => [canonSectionHeader(t), ft]); f._page = page._page; return f; });
     linePages = cutAtLicense(stripPageChrome(linePages));
     const results = [];
     let pending = null, carry = [];
@@ -1508,6 +1544,22 @@
     return total ? single / total : 0;
   }
 
+  // A creature name that reads as gibberish — the signature of a broken display font
+  // (Monster Manual 2024: "AeoLerH", "Vluprne FaullllR", "Srn"). A name is garbled
+  // when at least half its words are implausible: an internal lower->UPPER transition
+  // ("AeoLerH"), no vowel at all ("Srn"), or a run of 5+ consonants. Real names —
+  // including Conflux run-ons ("Assassincutthroat") and hyphenates — stay near zero.
+  function garbledName(nm) {
+    const words = String(nm || "").split(/\s+/).filter(w => /[A-Za-z]/.test(w));
+    if (!words.length) return true;
+    let bad = 0;
+    for (const w of words) {
+      const c = w.replace(/[^A-Za-z]/g, "");
+      if (c.length < 2 || /[a-z][A-Z]/.test(c) || !/[aeiouAEIOU]/.test(c) || /[^aeiouAEIOU]{5,}/i.test(c)) bad++;
+    }
+    return bad / words.length >= 0.5;
+  }
+
   async function importOneFile(file, onProgress) {
     if (!/\.pdf$/i.test(file.name)) return { ok: false, name: file.name, error: "Not a PDF file." };
     let buf;
@@ -1533,6 +1585,20 @@
       const flagged = blocks.filter(b => (b.parse_confidence || 0) < 0.85).length;
       if (flagged / blocks.length >= 0.5)
         return { ok: false, name: file.name, error: "The text layer looks scrambled (a broken font); the stat blocks are unreadable as text.", needsOcr: true };
+    }
+    // BROKEN FONT ENCODING AT SCALE (Monster Manual 2024). A subsetted display/label
+    // font extracts as garbage Unicode, so hundreds of "blocks" form but their name,
+    // ability scores, HP and CR are all lost ("AeoLerH", "Srn/Cott/lNr", "HP ls0",
+    // "CR l0") even though the body prose survives. A statless, gibberish-named block
+    // is unusable, so route the book to OCR (which reads the visually-correct glyphs)
+    // rather than importing a wall of junk. Gate on nearly ALL blocks being both
+    // low-confidence AND missing their core numbers — healthy books sit far below
+    // (flagged <5%, HP/CR populated), so a good import can never trip this.
+    if (blocks.length >= 8) {
+      const flagged = blocks.filter(b => (b.parse_confidence || 0) < 0.85).length;
+      const garbled = blocks.filter(b => garbledName(b.name)).length;
+      if (flagged / blocks.length >= 0.9 && garbled / blocks.length >= 0.2)
+        return { ok: false, name: file.name, error: "The text layer is scrambled (a broken embedded font); names and stats can't be read as text.", needsOcr: true };
     }
     const r = await persistBlocks(file, blocks);
     if (r.aborted) return { ok: false, name: file.name, aborted: true, added: r.added, dup: r.dup, flagged: r.flagged };
