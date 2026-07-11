@@ -1,6 +1,6 @@
 /* MonsterBox service worker — caches the app shell for offline use.
  * Bump CACHE when you change any cached asset to force an update. */
-const CACHE = "monsterbox-v155";
+const CACHE = "monsterbox-v156";
 const ASSETS = [
   "./", "index.html", "engine.js", "pdfimport.js", "cloud.js", "sync.js", "report.js", "manifest.webmanifest",
   "spells.json",
@@ -13,9 +13,16 @@ const ASSETS = [
 ];
 
 self.addEventListener("install", (e) => {
-  e.waitUntil(
-    caches.open(CACHE).then((c) => c.addAll(ASSETS)).then(() => self.skipWaiting())
-  );
+  // NOTE: deliberately NO skipWaiting() here. A freshly-installed worker WAITS
+  // until the user accepts the update via the in-app "new version" banner (which
+  // posts SKIP_WAITING below). Auto-activating mid-session was what left a page
+  // running a half-updated mix of old and new assets (imports silently breaking).
+  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)));
+});
+
+// The page posts this when the user clicks "Reload" on the update banner.
+self.addEventListener("message", (e) => {
+  if (e.data && e.data.type === "SKIP_WAITING") self.skipWaiting();
 });
 
 self.addEventListener("activate", (e) => {

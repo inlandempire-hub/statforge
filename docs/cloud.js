@@ -495,6 +495,23 @@
     if (!c) { render(); return; }   // supabase-js failed to load -> stay signed-out
     c.auth.getSession().then(({ data }) => onAuth(data ? data.session : null));
     c.auth.onAuthStateChange((_evt, s) => onAuth(s));
+    startKeepAlive();
+  }
+
+  // The backend runs on Render's free tier, which sleeps after ~15 min idle. The
+  // first request while it is cold takes 30-60s and times out — surfacing as
+  // "Sync paused (couldn't reach the server)" even though nothing is wrong. Ping
+  // /health on load (to start waking it) and every 10 min while the app is open,
+  // so it stays warm during a session. When a ping succeeds after sync had failed,
+  // re-kick the sync so it recovers on its own instead of staying paused. Local
+  // dev (:8090) is skipped.
+  function startKeepAlive() {
+    if (!API_BASE || /^(127\.0\.0\.1|localhost)$/.test(location.hostname)) return;
+    const ping = () => directFetch(API_BASE + "/health", { cache: "no-store" })
+      .then((r) => { if (r && r.ok && window.sfSyncStatus && window.sfSyncStatus() === "error" && window.sfSyncNow) window.sfSyncNow(); })
+      .catch(() => {});
+    ping();
+    setInterval(ping, 10 * 60 * 1000);
   }
 
   // sync.js reports its status here; show it on the account card

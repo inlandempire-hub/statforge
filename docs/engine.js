@@ -406,18 +406,56 @@
   };
 
   // ------------------------------------------------------ service worker
+  // A new deploy installs a new worker that WAITS (sw.js no longer skipWaiting()s
+  // on install). We show a one-click "new version" banner; only when the user
+  // accepts do we tell the worker to take over and then reload — so a version
+  // change can never wedge a live session between old and new assets.
+  function showUpdateBanner(worker) {
+    if (!worker || document.getElementById("sf-update-bar")) return;
+    const bar = document.createElement("div");
+    bar.id = "sf-update-bar";
+    bar.setAttribute("role", "status");
+    bar.style.cssText = "position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:99999;" +
+      "display:flex;gap:12px;align-items:center;background:#1b1815;color:#efe9df;border:1px solid #b23b3b;" +
+      "border-radius:10px;padding:10px 14px;box-shadow:0 6px 24px rgba(0,0,0,.45);font-size:14px;max-width:92vw;";
+    const span = document.createElement("span");
+    span.textContent = "A new version of MonsterBox is ready.";
+    const btn = document.createElement("button");
+    btn.textContent = "Reload";
+    btn.style.cssText = "background:#b23b3b;color:#fff;border:0;border-radius:7px;padding:6px 14px;cursor:pointer;font:inherit;";
+    btn.onclick = () => { btn.textContent = "Updating…"; btn.disabled = true; _updateAccepted = true; worker.postMessage({ type: "SKIP_WAITING" }); };
+    bar.appendChild(span); bar.appendChild(btn);
+    document.body.appendChild(bar);
+  }
+
+  let _updateAccepted = false;
   if ("serviceWorker" in navigator) {
-    // updateViaCache:"none" => the browser always revalidates sw.js itself, so a
-    // new deploy is picked up instead of being masked by the HTTP cache (up to 24h).
-    window.addEventListener("load", () =>
-      navigator.serviceWorker.register("sw.js", { updateViaCache: "none" }).catch(() => {}));
-    // when a freshly-installed worker takes control, reload once so the page runs
-    // the new assets (guarded so it only fires after an actual update, not first load).
-    let _swReloaded = false;
+    // Reload the page only AFTER the user accepted an update and the new worker
+    // took control — never on first install or a background control change.
     navigator.serviceWorker.addEventListener("controllerchange", () => {
-      if (_swReloaded) return;
-      _swReloaded = true;
-      if (navigator.serviceWorker.controller) location.reload();
+      if (_updateAccepted) location.reload();
     });
+    // updateViaCache:"none" => the browser always revalidates sw.js itself, so a
+    // new deploy is detected instead of being masked by the HTTP cache (up to 24h).
+    navigator.serviceWorker.register("sw.js", { updateViaCache: "none" }).then((reg) => {
+      // A worker in the WAITING state only ever happens when it is REPLACING an
+      // existing one (first installs activate straight away) — so its mere
+      // presence means a genuine update is ready. No controller check needed
+      // (controller can be momentarily null right after a hard reload). reg.waiting
+      // can populate a beat AFTER register() resolves, so re-check a few times.
+      const maybeBanner = () => { if (reg.waiting) showUpdateBanner(reg.waiting); };
+      maybeBanner();
+      navigator.serviceWorker.ready.then(maybeBanner).catch(() => {});
+      [400, 1500, 4000].forEach((t) => setTimeout(maybeBanner, t));
+      reg.addEventListener("updatefound", () => {
+        const nw = reg.installing;
+        if (!nw) return;
+        nw.addEventListener("statechange", () => {
+          if (nw.state === "installed" && navigator.serviceWorker.controller) showUpdateBanner(nw);
+        });
+      });
+      // A long-open tab won't otherwise notice a deploy; re-check hourly.
+      setInterval(() => reg.update().catch(() => {}), 60 * 60 * 1000);
+    }).catch(() => {});
   }
 })();
